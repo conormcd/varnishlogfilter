@@ -1,0 +1,9 @@
+Requirements:
+
+perl
+varnishlog
+Parse::RecDescent
+
+Example:
+
+varnishlogfilter -c 'client.ip == "10.0.0.1"'

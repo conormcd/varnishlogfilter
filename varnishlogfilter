@@ -1,0 +1,312 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Getopt::Std;
+use Parse::RecDescent;
+
+# Get the arguments
+my %OPT;
+getopts('bCcdk:n:r:s:u', \%OPT);
+
+# Normalise the arguments
+if ($OPT{'b'} && $OPT{'c'}) {
+	delete $OPT{'b'};
+	delete $OPT{'c'};
+}
+
+# The remainder of the arguments are the expression.
+my $expression = &translate_expression(join(' ', @ARGV));
+
+# Build the command line for varnishlog
+my $varnishlog_cmd = "varnishlog -o";
+foreach my $switch ('b', 'C', 'c', 'd', 'u') {
+	if ($OPT{$switch}) {
+		$varnishlog_cmd .= " -$switch";
+	}
+}
+foreach my $switch ('k', 'n', 'r', 's') {
+	if ($OPT{$switch}) {
+		$varnishlog_cmd .= " -$switch $OPT{$switch}";
+	}
+}
+$varnishlog_cmd .= ' |';
+
+# Run varnishlog and parse the output
+if (open(VARNISHLOG, $varnishlog_cmd)) {
+	my $log_id = -1;
+	my @log;
+	while (<VARNISHLOG>) {
+		if (/^\s*(\d+)\s+/o) {
+			my $id = $1;
+			if (@log && $log_id != $id) {
+				my %log = &parse_log(@log);
+				if (%log) {
+					if (eval $expression) {
+						foreach (@log) {
+							print;
+						}
+						print "\n";
+					}
+				}
+				@log = ();
+			}
+			push @log, $_;
+			if (/\bReqEnd\b/o) {
+				$log_id = 0;
+			} else {
+				$log_id = $id;
+			}
+		} elsif (/^\s+$/o) {
+			# Ignore
+		} else {
+			print "Un-parseable line:\n\n$_\n\n";
+		}
+	}
+	close(VARNISHLOG);
+} else {
+	die "Failed to run $varnishlog_cmd";
+}
+
+sub translate_expression {
+	my $expr = shift;
+
+	my $parser = new Parse::RecDescent(q{
+		expr: '(' expr ')'
+			{ $return = "($item[2])"; 1; }
+		expr: '!' expr
+			{ $return = "(!($item[2]))"; 1; }
+		expr: rule bool_op expr
+			{ $return = "(($item[1]) $item[2] ($item[3]))"; 1; }
+		expr: rule
+			{ $return = $item[1]; 1; }
+
+		rule: property str_op string
+			{ $return = "$item[1] $item[2] '$item[3]'"; 1; }
+		rule: string str_op property
+			{ $return = "$item[3] $item[2] '$item[1]'"; 1; }
+		rule: property num_op number
+			{ $return = "$item[1] $item[2] $item[3]"; 1; }
+		rule: number num_op property
+			{ $return = "$item[3] $item[2] $item[1]"; 1; }
+		rule: property match_op regex
+			{ $return = "$item[1] $item[2] $item[3]"; 1; }
+
+		str_op: '=='
+			{ $return = 'eq'; 1 }
+		str_op: '!='
+			{ $return = 'ne'; 1 }
+		str_op: '<'
+			{ $return = 'lt'; 1 }
+		str_op: '<='
+			{ $return = 'le'; 1 }
+		str_op: '>='
+			{ $return = 'ge'; 1 }
+		str_op: '>'
+			{ $return = 'gt'; 1 }
+
+		num_op: '==' | '!=' | '<' | '<=' | '>=' | '>'
+			{ $return = $item[1]; 1; }
+
+		bool_op: '&&' | '||'
+			{ $return = $item[1]; 1; }
+
+		match_op: '~'
+			{ $return = '=~'; 1; }
+		match_op: '!~'
+			{ $return = $item[1]; 1; }
+
+		property: /[a-zA-Z_][a-zA-Z0-9.]*/
+			{
+				$return = '$log';
+				foreach (split(/\./o, $item[1])) {
+					if (/^\\d+$/o) {
+						$return .= sprintf("[%d]", $_);
+					} else {
+						$return .= sprintf("{'%s'}", $_);
+					}
+				}
+				1;
+			}
+
+		regex: string
+			{ $return = "/$item[1]/"; 1; }
+
+		number: /[0-9](?:\.[0-9]+)?/
+			{ $return = $item[1]; 1; }
+
+		string: /"[^"]*"/
+			{ $return = $item[1]; $return =~ s/(?:^"|"$)//g; 1; }
+		string: /'[^"]*'/
+			{ $return = $item[1]; $return =~ s/(?:^'|'$)//g; 1; }
+	});
+
+	return $parser->expr($expr);
+}
+
+sub parse_log {
+	my @log = @_;
+
+	my %log;
+	foreach my $line (@log) {
+		if ($line =~ /^\s*\d+\s+(\w+)\s+([bc-])\s+(.*)$/o) {
+			my $type = $1;
+			my $direction = $2;
+			my $details = $3;
+
+			if ($direction eq 'b') {
+				if ($type eq 'BackendOpen') {
+					my @d = split(/\s+/o, $details);
+					$log{'backend'}{'name'} = $d[0];
+					$log{'backend'}{'ip'} = $d[3];
+					$log{'backend'}{'port'} = $d[4];
+					$log{'backend'}{'connection'} = 'open';
+				} elsif ($type eq 'BackendClose') {
+					$log{'backend'}{'name'} = $details;
+					$log{'backend'}{'connection'} = 'close';
+				} elsif ($type eq 'BackendReuse') {
+					$log{'backend'}{'name'} = $details;
+					$log{'backend'}{'connection'} = 'reuse';
+				} elsif ($type eq 'Length') {
+					$log{'backend'}{'response_length'} = $details;
+				} elsif ($type eq 'RxHeader') {
+					$log{'backend'}{'header'} = &add_header(
+						$details,
+						$log{'backend'}{'header'}
+					);
+				} elsif ($type eq 'RxProtocol') {
+					$log{'backend'}{'protocol'} = $details;
+				} elsif ($type eq 'RxResponse') {
+					$log{'backend'}{'response'} = $details;
+				} elsif ($type eq 'RxStatus') {
+					$log{'backend'}{'status'} = $details;
+				} elsif ($type eq 'TxHeader') {
+					$log{'varnish'}{'header'} = &add_header(
+						$details,
+						$log{'varnish'}{'header'}
+					);
+				} elsif ($type eq 'TxProtocol') {
+					$log{'varnish'}{'protocol'} = $details;
+				} elsif ($type eq 'TxRequest') {
+					$log{'varnish'}{'request'} = $details;
+				} elsif ($type eq 'TxURL') {
+					$log{'varnish'}{'url'} = $details;
+				} else {
+					print "$type $direction $details\n\n\n" . join('', @log);
+					exit(0);
+				}
+			} elsif ($direction eq 'c') {
+				if ($type eq 'Backend') {
+					# TODO record this
+				} elsif ($type eq 'BackendClose') {
+					# TODO
+				} elsif ($type eq 'Debug') {
+					push @{$log{'varnish'}{'debug'}}, $details;
+				} elsif ($type eq 'Hit') {
+					$log{'varnish'}{'cache_result'} = 'Hit';
+					push @{$log{'varnish'}{'vcl'}}, "Hit $details";
+				} elsif ($type eq 'Interrupted') {
+					# TODO
+				} elsif ($type eq 'Length') {
+					$log{'varnish'}{'response_length'} = $details;
+				} elsif ($type eq 'ObjHeader') {
+					$log{'backend'}{'header'} = &add_header(
+						$details,
+						$log{'backend'}{'header'}
+					);
+				} elsif ($type eq 'ObjProtocol') {
+					$log{'backend'}{'protocol'} = $details;
+				} elsif ($type eq 'ObjResponse') {
+					$log{'varnish'}{'cache_result'} = 'Miss';
+					$log{'backend'}{'response'} = $details;
+				} elsif ($type eq 'ObjStatus') {
+					$log{'backend'}{'status'} = $details;
+				} elsif ($type eq 'ReqEnd') {
+					# TODO: Record times
+				} elsif ($type eq 'ReqStart') {
+					my @d = split(/\s+/o, $details);
+					$log{'client'}{'ip'} = $d[0];
+					# TODO: Find out what 1 & 2 do
+				} elsif ($type eq 'RxHeader') {
+					$log{'client'}{'header'} = &add_header(
+						$details,
+						$log{'client'}{'header'}
+					);
+				} elsif ($type eq 'RxProtocol') {
+					$log{'client'}{'protocol'} = $details;
+				} elsif ($type eq 'RxRequest') {
+					$log{'client'}{'request'} = $details;
+				} elsif ($type eq 'RxURL') {
+					$log{'client'}{'url'} = $details;
+				} elsif ($type eq 'SessionClose') {
+					# TODO
+				} elsif ($type eq 'SessionOpen') {
+					# TODO
+				} elsif ($type eq 'StatSess') {
+					# TODO
+				} elsif ($type eq 'TTL') {
+					# TODO
+				} elsif ($type eq 'TxHeader') {
+					$log{'varnish'}{'header'} = &add_header(
+						$details,
+						$log{'varnish'}{'header'}
+					);
+				} elsif ($type eq 'TxProtocol') {
+					$log{'varnish'}{'protocol'} = $details;
+				} elsif ($type eq 'TxResponse') {
+					$log{'varnish'}{'response'} = $details;
+				} elsif ($type eq 'TxStatus') {
+					$log{'varnish'}{'status'} = $details;
+				} elsif ($type eq 'VCL_call') {
+					push @{$log{'varnish'}{'vcl'}}, $details;
+				} else {
+					print "$type $direction $details\n\n\n" . join('', @log);
+					exit(0);
+				}
+			}
+		} else {
+			die "Un-parseable line:\n\n$line\n\n";
+		}
+	}
+
+	# Handle cookies, if present
+	foreach my $t ('client', 'backend', 'varnish') {
+		if ($log{$t} && $log{$t}{'header'} && $log{$t}{'header'}{'Cookie'}) {
+			my @cookies = split(/; /o, $log{$t}{'header'}{'Cookie'});
+			foreach (@cookies) {
+				my ($k, $v) = split(/=/o, $_, 2);
+				$log{$t}{'cookie'}{$k} = $v;
+			}
+		}
+	}
+
+	return %log;
+}
+
+sub add_header {
+	my $text = shift;
+	my $existing_headers = shift || {};
+
+	if ($text =~ /^(.*?):\s*(.*)$/o) {
+		my $header_name = $1;
+		my $header_value = $2;
+		if ($existing_headers->{$header_name}) {
+			my $t = ref($existing_headers->{$header_name});
+			if ($t && $t eq 'ARRAY') {
+				push @{$existing_headers->{$header_name}}, $header_value;
+			} else {
+				$existing_headers->{$header_name} = [
+					$existing_headers->{$header_name},
+					$header_value
+				];
+			}
+		} else {
+			$existing_headers->{$header_name} = $header_value;
+		}
+	} else {
+		die("Malformed header: $text");
+	}
+
+	return $existing_headers;
+}
