@@ -65,6 +65,12 @@ foreach my $switch ('k', 'n', 'r', 's') {
 }
 $varnishlog_cmd .= ' |';
 
+# Obey the spirit of the varnishlog command line arguments.
+# -C is already taken care of when translating the expression.
+if ($OPT{'u'}) {
+	$| = 1;
+}
+
 # Run varnishlog and parse the output
 if (open(VARNISHLOG, $varnishlog_cmd)) {
 	my $log_id = -1;
@@ -75,11 +81,13 @@ if (open(VARNISHLOG, $varnishlog_cmd)) {
 			if (@log && $log_id != $id) {
 				my %log = &parse_log(@log);
 				if (%log) {
-					if (eval $expression) {
-						foreach (@log) {
-							print;
+					{ no warnings;
+						if (!($expression) || eval $expression) {
+							foreach (@log) {
+								print;
+							}
+							print "\n";
 						}
-						print "\n";
 					}
 				}
 				@log = ();
@@ -107,6 +115,26 @@ sub translate_expression {
 	my $expr = shift;
 
 	my $parser = new Parse::RecDescent(q{
+		number: /[0-9]+(?:\.[0-9]+)?/
+			{ $return = $item[1]; 1; }
+
+		string: /"[^"]*"/
+			{ $return = $item[1]; $return =~ s/(?:^"|"$)//g; 1; }
+		string: /'[^"]*'/
+			{ $return = $item[1]; $return =~ s/(?:^'|'$)//g; 1; }
+	});
+	if ($OPT{'C'}) {
+		$parser->Extend(q{
+			regex: string
+				{ $return = "/$item[1]/io"; 1; }
+		});
+	} else {
+		$parser->Extend(q{
+			regex: string
+				{ $return = "/$item[1]/o"; 1; }
+		});
+	}
+	$parser->Extend(q{
 		expr: '(' expr ')'
 			{ $return = "($item[2])"; 1; }
 		expr: '!' expr
@@ -163,17 +191,6 @@ sub translate_expression {
 				}
 				1;
 			}
-
-		regex: string
-			{ $return = "/$item[1]/"; 1; }
-
-		number: /[0-9](?:\.[0-9]+)?/
-			{ $return = $item[1]; 1; }
-
-		string: /"[^"]*"/
-			{ $return = $item[1]; $return =~ s/(?:^"|"$)//g; 1; }
-		string: /'[^"]*'/
-			{ $return = $item[1]; $return =~ s/(?:^'|'$)//g; 1; }
 	});
 
 	return $parser->expr($expr);
